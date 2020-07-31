@@ -50,6 +50,25 @@ class Master(Script):
         if params.cdap_hdfs_user != params.cdap_user:
             helpers.create_hdfs_dir('/user/' + params.cdap_hdfs_user, params.cdap_hdfs_user, 775)
 
+        pids = self.__checkStaleProcess()
+        if pids != '':
+            raise Exception('Stale processes running on the system. First kill them using stop command and then trigger start')
+
+        appids = self.__checkStaleYarnProcess()
+        if appids != '':
+            appid_list = appids.splitlines()
+            if len(appid_list) > 1:
+                raise Exception('Stale master.services yarn applications running on the system. First kill them using stop command and then trigger start')
+
+            zkCliCommand = '/usr/hdp/current/zookeeper-client/bin/zkCli.sh -server ' + params.cdap_zookeeper_quorum
+            Execute(zkCliCommand + " ls /election/master.services > /tmp/election_master_services", user='zookeeper')
+            status, output = self.executeShellCommands('tail -n1 /tmp/election_master_services')
+            Execute("rm -rf /tmp/election_master_services", user='zookeeper')
+            if output != '' and output != '[]':
+                print 'Active master found. So continuing with start'
+            else:
+                raise Exception('Stale master.services yarn applications running on the system. First kill them using stop command and then trigger start')
+
         # Hack to work around CDAP-1967
         self.remove_jackson(env)
         daemon_cmd = format('/opt/cdap/master/bin/cdap master start')
@@ -71,6 +90,68 @@ class Master(Script):
         output = pipe.communicate()[0].strip()
         status = 0
         return status, output
+
+    def __checkStaleProcess(self):
+        ps_command = "ps -ef | grep 'cdap.service=master' | grep -v grep | awk '{print $2}'"
+        status, output = self.executeShellCommands(ps_command)
+        if output == '':
+            print 'No stale process'
+            return ''
+        else:
+            print 'Stale process found with pid(s): ' + output
+            return output
+
+    def __checkStaleYarnProcess(self):
+        import params
+        yarn_command = "/usr/hdp/current/hadoop-yarn-client/bin/yarn application -list | grep master.services | grep -v grep | awk '{print $1}'"
+        Execute(yarn_command + " > /tmp/yarn_master_services", user='cdap')
+        status, output = self.executeShellCommands('cat /tmp/yarn_master_services')
+        Execute("rm -rf /tmp/yarn_master_services", user='cdap')
+        if output == '':
+            print 'No stale yarn application'
+            return ''
+        else:
+            print 'Stale yarn application found with application id(s): ' + output
+            return output
+
+    def __killStaleProcess(self):
+        pids = self.__checkStaleProcess()
+        if pids == '':
+            return 0
+        else:
+            pid_list = pids.splitlines()
+            for pid in pid_list:
+                kill_command = "kill -9 " + str(pid)
+                Execute(kill_command, user='cdap')
+            new_pids = self.__checkStaleProcess()
+            if new_pids != '':
+                print 'Stale process could not be killed, pid(s): ' + str(new_pids)
+                return 1
+            return 0
+
+    def __killStaleYarnProcess(self):
+        import params
+        appids = self.__checkStaleYarnProcess()
+        if appids == '':
+            return 0
+        else:
+            zkCliCommand = '/usr/hdp/current/zookeeper-client/bin/zkCli.sh -server ' + params.cdap_zookeeper_quorum
+            Execute(zkCliCommand + " ls /election/master.services > /tmp/election_master_services", user='zookeeper')
+            status, output = self.executeShellCommands('tail -n1 /tmp/election_master_services')
+            Execute("rm -rf /tmp/election_master_services", user='zookeeper')
+            if output != '' and output != '[]':
+                print 'Skip killing yarn master application as active master is still running'
+                return 0
+            appid_list = appids.splitlines()
+            for appid in appid_list:
+                kill_yarn_command = "/usr/hdp/current/hadoop-yarn-client/bin/yarn application -kill " + str(appid)
+                Execute(kill_yarn_command, user='cdap')
+            time.sleep(5)
+            new_appids = self.__checkStaleYarnProcess()
+            if new_appids != '':
+                print 'Some stale yarn applications could not be killed, application id(s): ' + str(new_appids)
+                return 1
+            return 0
 
     def __killOlderProcesses(self):
         # execute ls /cdap/election/master.services and check if emty then only execute the following steps else exit
@@ -159,6 +240,12 @@ class Master(Script):
         print('sleep 60 seconds before kill the other service processes')
         time.sleep(60)
         self.__killOlderProcesses()
+        ret = self.__killStaleProcess()
+        if ret > 0:
+            raise Exception('Stale processes could not be killed. Please kill them manually')
+        ret = self.__killStaleYarnProcess()
+        if ret > 0:
+            raise Exception('Stale yarn applications could not be killed. Please kill them manually')
 
     def status(self, env):
         import status_params
